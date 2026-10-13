@@ -1,17 +1,19 @@
 import { timingSafeEqual } from 'node:crypto';
 
 // Replace api/index.js in the existing Vercel project with this file.
-// Required Vercel secrets: APP_CONNECT_TOKEN, TYPESAFE_API_KEY.
+// Required Vercel secrets: APP_CONNECT_TOKEN, AI_GATEWAY_API_KEY.
 // Connection-only bridge: no brokerage credentials, accounts, or orders.
 const SERVICE = 'kiwoom-jev-bridge';
-const PROTOCOL_VERSION = 1;
-const JEV_URL = 'https://api.typesafe.ai/v1/systemone';
+const PROTOCOL_VERSION = 2;
+const JEV_URL = 'https://ai-gateway.vercel.sh/typesafe/v1/systemone';
+const JEV_MODEL = 'typesafe-ai/jev';
 
 function reply(res, status, payload) {
   return res.status(status).json({
     service: SERVICE,
     protocolVersion: PROTOCOL_VERSION,
     tradingEnabled: false,
+    provider: 'vercel-ai-gateway',
     ...payload,
   });
 }
@@ -31,7 +33,7 @@ function validProbe(result) {
   const answer = result?.answers?.connection;
   const probabilities = answer?.probabilities;
   return typeof result?.model === 'string'
-    && /^jev-[a-zA-Z0-9_.-]{1,60}$/.test(result.model)
+    && result.model === JEV_MODEL
     && answer?.type === 'choice'
     && ['ready', 'not_ready'].includes(answer.choice)
     && unitNumber(answer.confidence)
@@ -82,8 +84,8 @@ export default async function handler(req, res) {
     return reply(res, 400, { status: 'error', code: 'INVALID_REQUEST' });
   }
 
-  const apiKey = (process.env.TYPESAFE_API_KEY || '').trim();
-  const model = (process.env.JEV_MODEL || 'jev-latest').trim();
+  const apiKey = (process.env.AI_GATEWAY_API_KEY || '').trim();
+  const model = JEV_MODEL;
   const context = {
     requestId: body.requestId,
     action: body.action,
@@ -94,9 +96,6 @@ export default async function handler(req, res) {
     return reply(res, 200, { ...context, status: 'ok' });
   }
   if (!apiKey) return reply(res, 503, { ...context, status: 'error', code: 'JEV_KEY_MISSING' });
-  if (!/^jev-[a-zA-Z0-9_.-]{1,60}$/.test(model)) {
-    return reply(res, 400, { ...context, status: 'error', code: 'JEV_REQUEST_REJECTED' });
-  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
