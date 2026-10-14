@@ -14,6 +14,7 @@ function reply(res, status, payload) {
     protocolVersion: PROTOCOL_VERSION,
     tradingEnabled: false,
     provider: 'vercel-ai-gateway',
+    bridgeVersion: 'gateway-diagnostics-1',
     ...payload,
   });
 }
@@ -27,6 +28,29 @@ function authorized(header, expected) {
 
 function unitNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+// Only fixed, allowlisted identifiers leave this function; never raw error text.
+async function gatewayErrorType(response) {
+  if (!response.body) return 'unknown';
+  const reader = response.body.getReader();
+  const chunks = []; let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 16384) return 'unknown';
+      chunks.push(Buffer.from(value));
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const allowed = ['authentication_error', 'invalid_api_key', 'unauthorized', 'forbidden',
+      'permission_denied', 'insufficient_credits', 'insufficient_quota', 'rate_limit_exceeded',
+      'invalid_request', 'invalid_request_error', 'model_not_found', 'provider_error'];
+    const candidates = [body?.error_type, body?.code, body?.error?.code, body?.error?.type];
+    return candidates.find(value => typeof value === 'string' && allowed.includes(value)) || 'unknown';
+  } catch { return 'unknown'; }
+  finally { await reader.cancel().catch(() => {}); }
 }
 
 function validProbe(result) {
@@ -96,6 +120,10 @@ export default async function handler(req, res) {
     return reply(res, 200, { ...context, status: 'ok' });
   }
   if (!apiKey) return reply(res, 503, { ...context, status: 'error', code: 'JEV_KEY_MISSING' });
+  if (apiKey === connectToken) return reply(res, 400, { ...context, status: 'error', code: 'GATEWAY_KEY_IS_CONNECT_TOKEN' });
+  if (/^Bearer\s/i.test(apiKey) || /[\s"']/.test(apiKey)) {
+    return reply(res, 400, { ...context, status: 'error', code: 'GATEWAY_KEY_FORMAT' });
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
@@ -124,13 +152,17 @@ export default async function handler(req, res) {
       }),
     });
     if (!response.ok) {
-      const code = response.status === 401 || response.status === 403 ? 'JEV_AUTH_FAILED'
+      const code = response.status === 401 ? 'GATEWAY_UNAUTHORIZED'
+        : response.status === 403 ? 'GATEWAY_FORBIDDEN'
         : response.status === 402 ? 'JEV_CREDIT_REQUIRED'
           : response.status === 429 ? 'JEV_RATE_LIMITED'
             : response.status >= 500 ? 'JEV_UNAVAILABLE' : 'JEV_REQUEST_REJECTED';
-      // Never expose upstream error bodies, authorization headers, or environment values.
-      if (response.body) await response.body.cancel();
-      return reply(res, response.status === 429 ? 429 : 502, { ...context, status: 'error', code });
+      const gatewayStatus = response.status;
+      const gatewayType = await gatewayErrorType(response);
+      console.warn(JSON.stringify({ event: 'jev_gateway_error', bridgeVersion: 'gateway-diagnostics-1',
+        requestId: body.requestId, gatewayStatus, gatewayType, code }));
+      return reply(res, response.status === 429 ? 429 : 502,
+        { ...context, status: 'error', code, gatewayStatus, gatewayType });
     }
     let result;
     try { result = await response.json(); }
